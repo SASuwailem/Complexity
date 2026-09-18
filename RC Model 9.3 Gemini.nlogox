@@ -1,0 +1,2193 @@
+<?xml version="1.0" encoding="utf-8"?>
+<model version="NetLogo 7.0.4" snapToGrid="false">
+  <code><![CDATA[;; This version 9.3: NetLogo 7.04
+;; 1. Modified marginal propensity to consume of income and of wealth to be a function
+;; 2. Enhancements agianst division by zero.
+;; 3. Specified precision of consistency checks to 5 decimals.
+;; 4. Gemini Pro 3.1: https://share.gemini.google/bYFPJHy1WDGJ
+
+
+
+globals
+        [  seed-number time bankrupt acc-bankrupt consumption-ag consumption-md net-income-md wealth-ag net-income-ag net-worth-md
+           net-worth-ag var-c var-y var-nw total-debt total-amount-due total-surplus total-deficit total-payment total-interest-due
+           loan-share total-wealth total-net-worth net-wealth-ag net-wealth-md net-wealth-gap net-wealth-var
+           total-interest-payment total-interest-past-due total-markup-payment
+           total-markup-past-due loan-funds z-funds in-flow z-share eligible-deficit total-loan out-flow acc-c-wealth
+           total-principal-payment total-acc-loan wealth-md wealth-ma var-w consumption-gap net-income-gap net-worth-gap total-acc-surplus total-initial-surplus
+           total-acc-payment total-acc-principal-payment total-acc-markup-payment total-acc-interest-payment capital total-cash total-credit
+           total-a-share total-c-share factor total-c-wealth total-net-wealth total-fresh-surplus total-donation total-charity lorenz-points gini-index-reserve
+           ]
+
+patches-own
+       [  probability consumption income mean-income net-income p-income wealth donation class debt amount-due interest-c past-due interest-due
+          interest-payment interest-past-due interest-share markup-payment markup-due markup-share markup-c markup-past-due credit initial-surplus surplus net-surplus
+          loan default donor surplus-share  c-1 c-2 c-star avg-consumption payment interest-d installment-due principal-payment deficit net-worth
+          gap charity d mpc mpc-w net-wealth principal-debt markup-debt interest-debt gross-debt no-of-loans acc-payment
+          acc-loan acc-interest-payment acc-markup-payment acc-principal-payment acc-surplus acc-past-due
+          c-share a-share net-share adj-share c-wealth adj-wealth fresh-surplus limit-loan ]
+
+
+
+
+to setup
+  clear-all
+  set-random-seed
+  setup-patches
+  update-lorenz-and-gini
+
+  ; to be sure not to have interest-lending and markup-financing simultaneously
+  if (m > 0 and r > 0) [user-message "Warning: m & r > 0. r is set to zero"]
+  if m > 0 [
+    set r 0
+    set limit-amount-due true
+    ]
+  reset-ticks
+end
+
+
+
+
+;; To be able to reproduce a certain simulation you need to fix the seed number of the random number generator.
+to set-random-seed
+   ifelse fix-random-seed
+     [ let input-seed-number user-input "Type a seed number"
+       set seed-number read-from-string input-seed-number
+       random-seed seed-number ]
+     [ set seed-number new-seed ]
+   print (word "Seed number = " seed-number)
+   print (word "Start at " date-and-time)
+end
+
+
+
+to setup-patches
+  random-seed seed-number
+  ask patches [
+
+      ; set averge income for each agent and the mpc of income and wealth
+      set mean-income avg-income + (random  (2 * std-avg-income * avg-income)) - (std-avg-income * avg-income)
+
+      ;; ----------------------------------------------------
+      ;; INITIAL DYNAMIC MPC & MPC-W CALCULATION (With Proportional Noise)
+      ;; ----------------------------------------------------
+      let lambda (1 / (mean-income + 0.01))
+
+      ; 1. Calculate the theoretical baseline on the curve
+      let base-mpc mpc-min + (mpc-max - mpc-min) * exp (-1 * lambda * mean-income)
+
+      ; 2. Apply the stochastic noise proportionally
+      set mpc base-mpc + (random-float (2 * std-mpc * base-mpc)) - (std-mpc * base-mpc)
+
+      ; 3. Safety bounds to prevent impossible economic behavior
+      if mpc > 0.99 [ set mpc 0.99 ]
+      if mpc < 0 [ set mpc 0 ]
+
+
+      ;; --- For Wealth ---
+      let lambda-w (1 / ((mean-income * 5) + 0.01))
+
+      let base-mpc-w mpc-w-min + (mpc-w-max - mpc-w-min) * exp (-1 * lambda-w * net-worth)
+
+      set mpc-w base-mpc-w + (random-float (2 * std-mpc-w * base-mpc-w)) - (std-mpc-w * base-mpc-w)
+
+      if mpc-w > 0.99 [ set mpc-w 0.99 ]
+      if mpc-w < 0 [ set mpc-w 0 ]
+      ;; ----------------------------------------------------
+
+
+      set consumption mpc * mean-income
+      set pcolor scale-color brown (consumption) 1 139
+
+      ; set relative-consumption parameter
+      set d relativity + (random-float (2 * std-r * relativity) ) - (std-r * relativity)
+          if d >= 1 [set d .9]
+
+      ; set initial surplus and wealth
+      set initial-surplus 10
+      set acc-surplus initial-surplus
+      set wealth initial-surplus
+
+      ; each agent is setup to be able to obtain financing (no default; no limit of credit)
+      set default 0
+      set limit-loan false
+    ]
+
+  set capital sum [acc-surplus] of patches
+  set total-initial-surplus sum [initial-surplus] of patches
+  set loan-funds total-initial-surplus
+  set in-flow total-initial-surplus
+  random-seed seed-number
+end
+
+
+
+to check-bankruptcy
+   ask patches [
+       if default = 0 [
+          ; if amount of installment exceeds twice the average income, then agent's wealth will be used to pay off his debt--wealth is "confescated".
+          if amount-due > 2 * mean-income
+             [ ifelse net-worth > 0   ; if net-worth > o, this means the agent has more wealth than debt
+               [ set c-wealth debt    ; the amount of confescated wealth (c-wealth) is equal to the outstanding debt.
+                 set debt 0
+                 set principal-debt 0
+                 set markup-debt 0
+                 set interest-debt 0
+                 ]
+             ; else, if net-worth <= 0, then the agent has less wealth than debt.
+             [ set c-wealth wealth
+                declare-bankruptcy ] ; end of else
+            ] ; end of if amount-due > 2 * mean-income
+          ] ; end of if default = 0
+         ] ; end of ask
+end
+
+
+
+to check-markup-limit
+   if limit-amount-due = true    ; in case of markup, creditors need to limit the amount of installment.
+      [
+        ask patches [
+           if amount-due >= .5 * mean-income [
+               if m > 0                              ; to avoid sensitivities of random number generator
+                  [ ifelse wealth > 0.1 * gross-debt
+                      [ set c-wealth 0.1 * gross-debt
+                        set principal-debt principal-debt - ( (1 - markup-share) * c-wealth ) ; reduce principal-debt by its share
+                            if principal-debt < 0 [set principal-debt 0]
+                        set markup-debt markup-debt - ( markup-share * c-wealth ) ; reduce markup-debt by its share
+                            if markup-debt < 0 [set markup-debt 0]
+                        ;update debt
+                        set debt principal-debt + markup-past-due
+                        set limit-loan false
+                        ]
+
+                 ; else, if wealth <= 0.1 * gross-debt, then:
+                 [ set limit-loan true ]
+                 ] ; end of ifelse
+                    ] ]; end of ask.
+        ] ; end of markup finance condition
+end
+
+
+
+;; calculate total confescated wealth: c-wealth
+to cal-c-wealth
+   set total-c-wealth sum [c-wealth] of patches
+   set acc-c-wealth acc-c-wealth + total-c-wealth
+end
+
+
+
+;;adjust shres of agents in aggregate wealth
+to adjust-shares
+   if total-c-wealth > 0   ;; c-wealth: confescated wealth
+     [
+       ask patches [
+          ; --- Safe Division for Wealth ---
+          set c-share ifelse-value (total-wealth != 0) [ c-wealth / total-wealth ] [ 0 ]
+          set net-share ifelse-value (total-wealth != 0) [ (wealth - c-wealth) / total-wealth ] [ 0 ]
+
+          ifelse c-wealth > 0
+              [ set a-share 0   ;; a-share: share of agents with no confescated wealth
+                set adj-share net-share ]
+              ; else:
+              [ set a-share net-share  ] ; end of else
+               ] ; end of ask
+
+      set total-a-share sum [a-share] of patches
+      set total-c-share sum [c-share] of patches
+
+      ; --- Safe Division for Factor ---
+      set factor ifelse-value (total-a-share != 0) [ (total-a-share + total-c-share) / total-a-share ] [ 0 ]
+
+      ask patches [
+          if a-share > 0 [ set adj-share a-share * factor ]
+          set acc-surplus adj-share * capital
+          set surplus-share adj-share
+        ] ; end of ask
+      ] ; end of if total-c-wealth > 0
+end
+
+
+
+to update-net-wealth       ; we need to update debt and wealth after confiscating wealth.
+   if total-c-wealth > 0 [
+      set total-debt sum [debt] of patches
+      set total-credit total-debt ; identity
+      ask patches [
+          set wealth surplus-share * (total-cash + total-credit)
+          set net-wealth wealth - debt
+          set net-worth max (list net-wealth 0)
+          set c-wealth 0
+          set net-share 0
+          set adj-share 0
+          ]
+      set total-wealth sum [wealth] of patches
+      ]
+end
+
+
+to update-bankruptcy
+   ask patches [
+       if default > 0
+          [ ifelse default = delay-time + 1    ; if the agent has been in defualt for the period of delay-time + 1, then he is released from bankruptcy
+              [ set default 0
+                set income abs(random-normal mean-income std)
+                set consumption mpc * income
+                set fresh-surplus 10
+                set pcolor scale-color brown (consumption) 1 139
+                ]
+              ; else
+              [ declare-bankruptcy ] ; end of else
+          ] ; end of if default > 0
+       ] ; end of ask
+
+
+
+       ; update counting
+       let past-bankrupt bankrupt
+       set bankrupt count patches with [default > 0]
+       let d-bankrupt max (list (bankrupt - past-bankrupt) 0)
+       set acc-bankrupt acc-bankrupt + d-bankrupt
+
+end
+
+
+to generate-income
+    ask patches [
+          if default = 0
+              [ ;; Generate income using a truncated normal distribution
+                set income max (list 0 (random-normal mean-income (std * mean-income)))
+
+                set net-income ( income + interest-c + markup-c - amount-due )
+                ifelse net-income < 0
+                    [ set past-due abs(net-income)
+                      set payment max (list (amount-due - past-due) 0)
+                      ]
+                    [ set payment amount-due
+                      set past-due 0 ]
+
+                set p-income max (list net-income 0)
+
+                ;; ----------------------------------------------------
+                ;; DYNAMIC MPC & MPC-W CALCULATION (With Proportional Noise)
+                ;; ----------------------------------------------------
+                let lambda (1 / (mean-income + 0.01))
+
+                ; 1. Calculate the theoretical baseline on the curve
+                let base-mpc mpc-min + (mpc-max - mpc-min) * exp (-1 * lambda * p-income)
+
+                ; 2. Apply the stochastic noise proportionally
+                set mpc base-mpc + (random-float (2 * std-mpc * base-mpc)) - (std-mpc * base-mpc)
+
+                ; 3. Safety bounds to prevent impossible economic behavior
+                if mpc > 0.99 [ set mpc 0.99 ]
+                if mpc < 0 [ set mpc 0 ]
+
+
+                ;; --- For Wealth ---
+                let lambda-w (1 / ((mean-income * 5) + 0.01))
+
+                let base-mpc-w mpc-w-min + (mpc-w-max - mpc-w-min) * exp (-1 * lambda-w * net-worth)
+
+                set mpc-w base-mpc-w + (random-float (2 * std-mpc-w * base-mpc-w)) - (std-mpc-w * base-mpc-w)
+
+                if mpc-w > 0.99 [ set mpc-w 0.99 ]
+                if mpc-w < 0 [ set mpc-w 0 ]
+                ;; ----------------------------------------------------
+             ]
+        ]
+end
+
+
+
+
+to cal-payments
+    ask patches [
+        set interest-payment interest-share * payment
+        set interest-past-due interest-share * past-due
+        set markup-payment markup-share * payment
+        set markup-past-due markup-share * past-due
+        set principal-payment payment - interest-payment - markup-payment
+        set interest-c surplus-share * total-interest-payment
+        set markup-c surplus-share * total-markup-payment
+
+        ]
+    set total-payment sum [payment] of patches
+    set total-principal-payment sum [principal-payment] of patches
+    set total-markup-payment sum [markup-payment] of patches
+    set total-interest-payment sum [interest-payment] of patches
+    set total-interest-past-due sum [interest-past-due] of patches
+    set total-markup-past-due sum [markup-past-due] of patches
+    set total-acc-payment total-acc-payment + total-payment
+    set total-acc-principal-payment total-acc-principal-payment + total-principal-payment
+    set total-acc-markup-payment total-acc-markup-payment + total-markup-payment
+    set total-acc-interest-payment total-acc-interest-payment + total-interest-payment
+end
+
+
+
+
+
+;; calculate ideal consumption level
+to cal-c-star
+  ask patches [
+     set avg-consumption mean [consumption] of neighbors
+     set c-1 (1 - d) * ( (mpc * p-income) + (mpc-w * net-worth) )
+     set c-2 d * avg-consumption
+     set c-star c-1 + c-2
+     ]
+end
+
+
+
+to cal-deficit-surplus
+   ask patches [
+       if default = 0 [
+         set gap p-income - c-star
+         ifelse gap >= 0
+           [ set surplus gap
+             set deficit 0
+             ]
+           [ set deficit abs(gap)
+             set surplus 0
+             ]
+        set acc-surplus acc-surplus + surplus + fresh-surplus
+
+          ] ; end of if default = 0
+      ] ; end of ask
+   set total-deficit sum [deficit] of patches
+   set total-surplus sum [surplus] of patches
+   set total-fresh-surplus sum [fresh-surplus] of patches
+   set in-flow in-flow + total-surplus + total-principal-payment
+   set capital capital + total-surplus + total-fresh-surplus
+   set out-flow out-flow + total-loan
+
+end
+
+
+
+to cal-donations
+    ask patches [
+        ifelse net-worth >= net-worth-ag
+            [ set donor 1
+              set donation (z / 1200) * net-worth
+              set charity 0 ]
+            [ set donation 0
+              ifelse deficit > 0
+                [ set donor -1 ]
+                [ set donor 0 ] ]
+                ]
+
+    ; calculate charity
+    set total-donation sum [donation] of patches
+    set total-charity sum [charity] of patches
+    set z-funds z-funds + total-donation - total-charity
+    set eligible-deficit sum [deficit] of patches with [net-worth < net-worth-ag]
+    if eligible-deficit = 0 [set eligible-deficit 1]
+    set z-share z-funds / eligible-deficit
+    if z-share > 1 [set z-share 1]
+end
+
+
+
+to cal-loan-share
+   set loan-funds loan-funds + total-surplus + total-principal-payment - total-loan ; this is a measure of cash-stock available for lending before consumption is actiually set.
+       if loan-funds < 0
+         [set loan-funds 0
+          user-message "negative loan-funds"]
+
+   let total-deficit-1 max (list total-deficit 1)
+   set loan-share min (list (loan-funds / total-deficit-1) 1)
+   if allow-lending = false [ set loan-share 0 ]
+end
+
+
+
+
+to set-consumption
+   ask patches [
+       if default = 0 [
+          ifelse gap >= 0
+             [ set consumption c-star
+               set loan 0
+               set charity 0 ]
+
+             ;else, if gap < 0, then:
+             [ ifelse net-worth < net-worth-ag
+                 [ set charity z-share * deficit
+                   set donation 0 ]
+                 [ set charity 0 ]; end of second ifesle
+
+               set loan loan-share * (deficit - charity)
+               set consumption (p-income + loan + charity) ]; end of first else.
+
+          ; check markup condition
+          if limit-loan = true
+             [ set loan 0
+               set consumption (p-income + charity)
+               set limit-loan false ]
+          set pcolor scale-color brown (consumption) 1 139
+          ] ]
+end
+
+
+to cal-debt
+
+   ask patches [
+     if default = 0 [
+       set principal-debt max (list (principal-debt + loan - principal-payment) 0) ;
+       set markup-debt max (list (markup-debt + (loan-period * (m / 1200) * loan) - markup-payment) 0)
+       set interest-debt max (list (interest-debt + (loan-period * (r / 1200) * debt) - interest-payment) 0)
+       set gross-debt principal-debt + interest-debt + markup-debt
+       set debt max (list (principal-debt + markup-past-due + interest-past-due) 0)
+       set acc-payment acc-payment + payment
+       if (markup-debt > 0 and interest-debt > 0) [user-message "warning: m & r > 0"]; just to check
+
+ ; calculate installment and interest:
+       set amount-due gross-debt / loan-period
+       set interest-due interest-debt / loan-period
+       set markup-due markup-debt / loan-period
+       let gross-debt-1 max (list gross-debt 1)
+       set interest-share interest-debt / gross-debt-1
+       set markup-share markup-debt / gross-debt-1
+        ] ; end of if
+     ] ; end of ask.
+
+    set total-amount-due sum [amount-due] of patches
+    set total-debt sum [debt] of patches
+    set total-credit total-debt ; identity
+    set total-loan sum [loan] of patches
+    ; update-loans
+    ask patches [
+          set acc-loan acc-loan + loan
+          if loan > 0 [ set no-of-loans no-of-loans + 1]
+          ] ; end of update-loans
+
+end
+
+
+
+
+to cal-surplus-shares
+   ask patches [
+       if default = 0 [ set surplus-share acc-surplus / capital ]
+       ]
+end
+
+
+
+to cal-wealth
+     ; update cash stock:
+     set total-cash loan-funds - total-loan
+     ask patches [
+        set wealth surplus-share * (total-cash + total-credit)
+        set net-wealth wealth - debt
+        set net-worth max (list (net-wealth - donation) 0)
+        set fresh-surplus 0
+        ]
+    set total-wealth sum [wealth] of patches
+    set total-net-worth sum [net-wealth] of patches
+end
+
+
+
+
+to declare-bankruptcy
+          set default default + 1
+          set pcolor red
+          set debt 0
+          set principal-debt 0
+          set gross-debt 0
+          set markup-debt 0
+          set interest-debt 0
+          set consumption 0
+          set income 0
+          set net-income 0
+          set loan 0
+          set amount-due 0
+          set past-due 0
+          set interest-due 0
+          set interest-c 0
+          set interest-payment 0
+          set interest-past-due 0
+          set principal-payment 0
+          set markup-due 0
+          set markup-c 0
+          set markup-past-due 0
+          set markup-payment 0
+          set payment 0
+          set credit 0
+          set wealth 0
+          set net-wealth 0
+          set net-worth 0
+          set surplus 0
+          set deficit 0
+          set gap 0
+          set acc-surplus 0
+          set surplus-share 0
+          set fresh-surplus 0
+end
+
+
+
+
+to decide-consumption
+      check-bankruptcy
+      check-markup-limit
+      cal-c-wealth
+      adjust-shares
+      update-net-wealth
+      update-bankruptcy
+      generate-income
+      cal-payments
+      cal-c-star
+      cal-deficit-surplus
+      cal-donations
+      cal-loan-share
+      set-consumption
+      cal-debt
+      cal-surplus-shares
+      cal-wealth
+end
+
+
+
+to update-lorenz-and-gini
+  let sorted-wealths sort [wealth] of patches
+  let total-wealth-l sum sorted-wealths
+
+  ;; Prevent division by zero if all wealth in the economy is wiped out
+  if total-wealth-l = 0 [ set total-wealth-l 1 ]
+
+  let wealth-sum-so-far 0
+  let index 0
+  set gini-index-reserve 0
+  set lorenz-points []
+  let total-patches count patches
+
+  ;; now actually plot the Lorenz curve -- along the way, we also
+  ;; calculate the Gini index.
+  repeat total-patches [
+    set wealth-sum-so-far (wealth-sum-so-far + item index sorted-wealths)
+    set lorenz-points lput ((wealth-sum-so-far / total-wealth-l) * 100) lorenz-points
+    set index (index + 1)
+    set gini-index-reserve gini-index-reserve + (index / total-patches) - (wealth-sum-so-far / total-wealth-l)
+  ]
+end
+
+
+to cal-averages
+      set consumption-ag (mean [consumption] of patches)
+      set net-income-ag mean [net-income] of patches
+      set net-worth-ag mean [net-worth] of patches
+      set wealth-ag mean [wealth] of patches
+      set net-wealth-ag mean [net-wealth] of patches
+end
+
+to cal-medians
+      set consumption-md median [consumption] of patches
+      set net-income-md median [net-income] of patches
+      set net-worth-md median [net-worth] of patches
+      set wealth-md median [wealth] of patches
+      set net-wealth-md median [net-wealth] of patches
+end
+
+
+
+to cal-vars
+  set var-c ifelse-value (consumption-ag != 0)
+    [ (standard-deviation [consumption] of patches) / consumption-ag ] [ 0 ]
+
+  set var-y ifelse-value (net-income-ag != 0)
+    [ (standard-deviation [net-income] of patches) / net-income-ag ] [ 0 ]
+
+  set var-nw ifelse-value (net-wealth-ag != 0)
+    [ (standard-deviation [net-wealth] of patches) / net-wealth-ag ] [ 0 ]
+
+  set var-w ifelse-value (wealth-ag != 0)
+    [ (standard-deviation [wealth] of patches) / wealth-ag ] [ 0 ]
+end
+
+
+to go
+  set time time + 1
+  decide-consumption
+  cal-averages
+  cal-medians
+  cal-vars
+  update-lorenz-and-gini
+  tick
+  if time = set-time-end
+    [ print (word "End at " date-and-time)
+      stop ]
+
+
+end]]></code>
+  <widgets>
+    <view x="823" wrappingAllowedX="true" y="10" frameRate="30.0" minPycor="-17" height="429" showTickCounter="true" patchSize="12.0" fontSize="10" wrappingAllowedY="true" width="428" tickCounterLabel="ticks" maxPycor="17" updateMode="1" maxPxcor="17" minPxcor="-17"></view>
+    <switch x="5" y="380" height="33" on="true" variable="fix-random-seed" display="fix-random-seed" width="138" sizeVersion="0"></switch>
+    <slider x="152" step="5" y="12" max="150" display="avg-income" height="33" min="0" direction="Horizontal" default="75.0" variable="avg-income" width="160" sizeVersion="0"></slider>
+    <slider x="13" step="0.05" y="12" max="1" display="relativity" height="33" min="0" direction="Horizontal" default="0.5" variable="relativity" width="139" sizeVersion="0"></slider>
+    <slider x="153" step="0.05" y="78" max="0.5" display="std" height="33" min="0" direction="Horizontal" default="0.15" variable="std" width="159" sizeVersion="0"></slider>
+    <slider x="5" step="0.25" y="312" max="10" display="z" height="33" min="0" direction="Horizontal" default="0.0" variable="z" units="p.a.%" width="138" sizeVersion="0"></slider>
+    <switch x="5" y="180" height="33" on="true" variable="allow-lending" display="allow-lending" width="138" sizeVersion="0"></switch>
+    <slider x="5" step="1" y="212" max="25" display="m" height="33" min="0" direction="Horizontal" default="6.0" variable="m" units="p.a.%" width="138" sizeVersion="0"></slider>
+    <slider x="5" step="1" y="246" max="25" display="r" height="33" min="0" direction="Horizontal" default="0.0" variable="r" units="p.a.%" width="138" sizeVersion="0"></slider>
+    <switch x="5" y="279" height="33" on="true" variable="limit-amount-due" display="limit-amount-due" width="138" sizeVersion="0"></switch>
+    <slider x="5" step="10" y="346" max="3000" display="set-time-end" height="33" min="0" direction="Horizontal" default="1500.0" variable="set-time-end" width="138" sizeVersion="0"></slider>
+    <button x="5" y="413" height="33" disableUntilTicks="false" forever="false" kind="Observer" width="63" sizeVersion="0">setup</button>
+    <button x="5" y="445" height="33" disableUntilTicks="false" forever="true" kind="Observer" width="63" sizeVersion="0">go</button>
+    <plot x="368" autoPlotX="true" yMax="10.0" autoPlotY="true" y="161" xMin="0.0" height="150" legend="false" xMax="10.0" yMin="0.0" xAxis="Time" display="Net-wealth" width="235" sizeVersion="0">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="default" color="-7500403" legend="true">
+        <setup></setup>
+        <update>plot net-wealth-ag ; plots average net-wealth</update>
+      </pen>
+    </plot>
+    <plot x="602" autoPlotX="true" yMax="10.0" autoPlotY="true" y="161" xMin="0.0" height="150" legend="false" xMax="10.0" yMin="0.0" xAxis="Time" display="Income" width="220" sizeVersion="0">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="default" color="-7500403" legend="true">
+        <setup></setup>
+        <update>plot net-income-ag ; plots average net-income</update>
+      </pen>
+    </plot>
+    <plot x="146" autoPlotX="true" yMax="100.0" autoPlotY="true" y="161" xMin="0.0" height="150" legend="false" xMax="100.0" yMin="0.0" xAxis="Time" display="Consumption" width="222" sizeVersion="0">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="default" color="-16777216" legend="true">
+        <setup></setup>
+        <update>plot consumption-ag; plots average consumption</update>
+      </pen>
+    </plot>
+    <plot x="582" autoPlotX="true" yMax="10.0" autoPlotY="true" y="310" xMin="0.0" height="150" legend="true" xMax="10.0" yMin="0.0" display="Surplus &amp; Deficit" width="240" sizeVersion="0">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="surplus" color="-10899396" legend="true">
+        <setup></setup>
+        <update>plot total-surplus / count patches</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="deficit" color="-2674135" legend="true">
+        <setup></setup>
+        <update>plot total-deficit / count patches</update>
+      </pen>
+    </plot>
+    <plot x="325" autoPlotX="true" yMax="10.0" autoPlotY="true" y="310" xMin="0.0" height="150" legend="true" xMax="10.0" yMin="0.0" display=" Payments" width="258" sizeVersion="0">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="r/m" color="-8630108" legend="true">
+        <setup></setup>
+        <update>plot (total-interest-payment + total-markup-payment) / count patches
+; plots interest-payment or markup-payment (but not both)</update>
+      </pen>
+      <pen interval="1.0" mode="0" display="principal" color="-7500403" legend="true">
+        <setup></setup>
+        <update>plot total-principal-payment / count patches</update>
+      </pen>
+    </plot>
+    <monitor x="760" precision="2" y="117" height="45" fontSize="11" display="wealth" width="62" sizeVersion="0">mean [wealth] of patches</monitor>
+    <monitor x="697" precision="2" y="117" height="45" fontSize="11" display="net wealth" width="63" sizeVersion="0">mean [net-wealth] of patches</monitor>
+    <monitor x="637" precision="2" y="117" height="45" fontSize="11" display="supply" width="60" sizeVersion="0">; supply of loanable funds
+loan-funds / count patches</monitor>
+    <monitor x="584" precision="2" y="117" height="45" fontSize="11" display="demand" width="55" sizeVersion="0"><![CDATA[; demand for loans
+ifelse-value (count patches with [deficit > 0] > 0) [ total-deficit / count patches with [deficit > 0] ] [ 0 ]]]></monitor>
+    <slider x="13" step="0.025" y="45" max="2" display="std-r" height="33" min="0" direction="Horizontal" default="0.3" variable="std-r" units="ratio" width="139" sizeVersion="0"></slider>
+    <slider x="312" step="0.025" y="45" max="0.5" display="std-mpc" height="33" min="0" direction="Horizontal" default="0.15" variable="std-mpc" units="ratio" width="159" sizeVersion="0"></slider>
+    <slider x="152" step="0.01" y="45" max="2" display="std-avg-income" height="33" min="0" direction="Horizontal" default="0.3" variable="std-avg-income" units="ratio" width="160" sizeVersion="0"></slider>
+    <monitor x="531" precision="3" y="117" height="45" fontSize="11" display="turnover" width="53" sizeVersion="0"><![CDATA[; shows ratio of accumulated loans to accumulated surplus.
+ifelse-value (capital > 0) [ out-flow / capital ] [ 0 ]]]></monitor>
+    <monitor x="455" precision="3" y="117" height="45" fontSize="11" display="fin cost p.a.%" width="79" sizeVersion="0"><![CDATA[; shows effective annual cost of financing to debtors
+ifelse-value (out-flow > 0) [ 100 * 12 * (total-acc-markup-payment + total-acc-interest-payment) / (60 * out-flow) ] [ 0 ]]]></monitor>
+    <monitor x="381" precision="3" y="117" height="45" fontSize="11" display="return p.a.%" width="76" sizeVersion="0"><![CDATA[; shows annual return to creditors
+ifelse-value (capital > 0) [ 100 * 12 * (total-acc-markup-payment + total-acc-interest-payment) / (60 * capital) ] [ 0 ]]]></monitor>
+    <monitor x="252" precision="3" y="118" height="45" fontSize="11" display="pmt / loan" width="58" sizeVersion="0"><![CDATA[; shows total accumulated debt payments as a ratio
+; of total accumulated extended loans
+ifelse-value (out-flow > 0) [ total-acc-payment / out-flow ] [ 0 ]]]></monitor>
+    <plot x="146" autoPlotX="true" yMax="10.0" autoPlotY="true" y="310" xMin="0.0" height="150" legend="false" xMax="10.0" yMin="0.0" display="Bankruptcies" width="179" sizeVersion="0">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="No." color="-16777216" legend="true">
+        <setup></setup>
+        <update>plot bankrupt</update>
+      </pen>
+    </plot>
+    <monitor x="190" precision="3" y="118" height="45" fontSize="11" display="r/m share" width="62" sizeVersion="0">; shows the share of interest or markup payment
+; of total debt payment of agents
+mean [interest-share + markup-share] of patches</monitor>
+    <monitor x="307" precision="2" y="118" height="45" fontSize="11" width="73" sizeVersion="0">acc-bankrupt</monitor>
+    <slider x="312" step=".005" y="78" max="0.8" display="mpc-min" height="33" min="0.3" direction="Horizontal" default="0.7" variable="mpc-min" width="160" sizeVersion="0"></slider>
+    <plot x="244" autoPlotX="true" yMax="1.0" autoPlotY="true" yAxis="Gini coeff." y="488" xMin="0.0" height="186" legend="false" xMax="50.0" yMin="0.0" xAxis="Time" display="Gini Index" width="256" sizeVersion="0">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="default" color="-13345367" legend="true">
+        <setup></setup>
+        <update>plot (gini-index-reserve / count patches) / 0.5</update>
+      </pen>
+    </plot>
+    <monitor x="1190" precision="0" y="440" height="45" fontSize="11" width="63" sizeVersion="0">time</monitor>
+    <monitor x="1169" precision="3" y="545" height="45" fontSize="11" display="total wealth" width="80" sizeVersion="0">; total wealth must equal total cash + total credit
+precision (total-wealth - (total-cash + total-credit)) 5</monitor>
+    <note x="938" y="518" backgroundDark="0" fontSize="14" width="150" markdown="false" height="18" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">Consistency checks</note>
+    <monitor x="938" precision="6" y="545" height="45" fontSize="11" display="shares" width="57" sizeVersion="0">; total shares must equal 1
+precision (sum [surplus-share] of patches) 5</monitor>
+    <monitor x="994" precision="3" y="545" height="45" fontSize="11" display="(net-wealth) - (total-cash)" width="175" sizeVersion="0">; total-cash represents the aggregate net wealth f the economy
+precision (sum [net-wealth] of patches - total-cash) 5</monitor>
+    <monitor x="813" precision="3" y="545" height="45" fontSize="11" display="income-consumption" width="126" sizeVersion="0">; total sources of funds must equal total uses of the funds
+precision ((sum [p-income + loan + charity - consumption - surplus] of patches) / count patches) 5</monitor>
+    <plot x="501" autoPlotX="false" yMax="100.0" autoPlotY="false" yAxis="% of Wealth" y="488" xMin="0.0" height="186" legend="false" xMax="100.0" yMin="0.0" xAxis="% of Agents" display="Lorenz Curve" width="262" sizeVersion="0">
+      <setup></setup>
+      <update></update>
+      <pen interval="100.0" mode="0" display="equal" color="-16777216" legend="true">
+        <setup>plot 0
+  plot 100</setup>
+        <update></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="lorenz" color="-2674135" legend="true">
+        <setup></setup>
+        <update>plot-pen-reset
+set-plot-pen-interval 100 / count patches
+plot 0
+foreach lorenz-points plot</update>
+      </pen>
+    </plot>
+    <slider x="313" step="0.01" y="13" max="1" display="mpc-max" height="33" min=".8" direction="Horizontal" default="0.99" variable="mpc-max" width="159" sizeVersion="0"></slider>
+    <slider x="473" step="0.001" y="79" max=".025" display="mpc-w-min" height="33" min="0" direction="Horizontal" default="0.01" variable="mpc-w-min" width="164" sizeVersion="0"></slider>
+    <slider x="473" step="0.005" y="12" max="0.25" display="mpc-w-max" height="33" min="0" direction="Horizontal" default="0.025" variable="mpc-w-max" width="164" sizeVersion="0"></slider>
+    <slider x="473" step="0.025" y="46" max="0.5" display="std-mpc-w" height="33" min="0" direction="Horizontal" default="0.5" variable="std-mpc-w" units="ratio" width="164" sizeVersion="0"></slider>
+    <slider x="638" step="1" y="46" max="100" display="delay-time" height="33" min="1" direction="Horizontal" default="15.0" variable="delay-time" units="periods" width="172" sizeVersion="0"></slider>
+    <slider x="638" step="5" y="13" max="100" display="loan-period" height="33" min="10" direction="Horizontal" default="60.0" variable="loan-period" units="periods" width="172" sizeVersion="0"></slider>
+    <monitor x="131" precision="3" y="117" height="45" fontSize="11" display="income" width="60" sizeVersion="0">mean [income] of patches</monitor>
+    <monitor x="69" precision="3" y="117" height="45" fontSize="11" display="consumption" width="62" sizeVersion="0">mean [consumption] of patches</monitor>
+    <monitor x="143" precision="3" y="487" height="62" fontSize="11" width="100" display="Gini coefficient">(gini-index-reserve / count patches) / 0.5</monitor>
+  </widgets>
+  <info>## WHAT IS IT?
+
+This is a model of consumption in presence of "complex behavior". Complex behavior arises when agents interact with each other, such that consumption of each agent is affected by that of his or her neighbors or peers. 
+
+The theory and motivation behind the model is explained in Al-Suwailem (2008) and (2011).
+
+## HOW IT WORKS
+
+Consumption is modeled as a function of income and net-wealth. In addition, consumption of agents is affected by the average consumption of their neighbors. Accordingly, each agent prefers to choose consumption level close to his neighbors. However, if income is insufficient to finance the desired level of consumption, the agent needs to obtain external financing.
+
+There are three modes of finance that the model provides:
+
+1. Interest-free lending.
+2. Interest-based lending.
+3. Markup financing
+
+Interest-free lending does not generate income to lenders. Therefore it does not affect consumption behavior of lenders.
+
+Interest-based lending generates income to lenders. This affects lenders' consumption level, since higher income leads to higher consumption. As consumption of lenders rises, the average level of consumption of the group also rises. As average consumption rises, neighboring agents want to raise their consumption as well, because they want to conform to their neighbors. But this means they need to finance the higher level of consumption. 
+
+The second round of financing will generate additional income to lenders, which leads to a third round of financing, etc. Deficit agents, i.e. agents that need to finance their desired consumption, will fall into a viscous circle of borrowing. The circle stops only with bankruptcy, when amount-due exceeds the average income of the agent, whereby the agent is declared bankrupt.
+
+Markup financing finances only actual consumption, and does not allow for refinancing of previous debt. The income generated by financing (the markup) causes the consumption level of creditors to rise. But the vicious circle is blocked since no loans are allowed to finance previous debt. Financing is extended only for real consumption.
+
+The overall results of the model suggests that:
+
+1.    Markup financing is fundamentally different from interest or riba financing. Despite some apparent similarities, they have starkly different impacts on economic variables. 
+
+2.    Interest is not merely a price; it is a mechanism for debt growth. This is not the case for markup financing. Markup restricts debt to actual consumption, thus controlling the growth of debt to that of available resources. Interest in contrast allows debt to grow exponentially. Debt growth in this case is controlled not by interest but through bankruptcy.
+
+3.    Delayed payments are treated quite differently in the two models. In the interest model, they represent a source of income to lenders. This leads to very low turnover of funds, explosion of debt and consequently to economic cycles. The markup model does not allow for generating profits from these obligations. This puts an incentive to creditors not to extend credit beyond a level that would permit for delay to arise in the first place. 
+
+4.    The interest model demonstrates several undesirable results. These include: cycles and instability, wealth concentration, low fund utilization and thus high inefficiency, and high costs of borrowing. In contrast, the markup model shows stability, high efficiency, less concentration of wealth, and relatively low costs of financing.
+
+5.    The markup model is slightly more concentrated than the standard model, but it shows higher savings and liquidity. Although not modeled at this stage, higher savings potentially promote higher investment and higher economic growth.
+ 
+
+Charity
+
+When consumption is affected by that of neighbors, charity have a qualitiatively different impact. Transfers from high net-worth agents to low net-worth ones, might improve consumption of both, donors and receivers. 
+
+
+## HOW TO USE IT
+
+You need to decide which mode of finance you want to explore.
+
+1. For interest-free model, set r = 0, and m = 0 in the interface. This prevents any interest (r) or markup (m) to be charged.
+
+2. For interest-based model, set r to any positive number, for example 6% p.a. Be sure to set m = 0. You cannot have both m and r positive.
+
+3. For markup-model, set m = 6% p.a., or any number you choose. Be sure that "limit-amount-due" button is on. 
+
+This button protects creditors in the markup model from extending too much credit to consumers, for which they do not get any returns. An important difference between markup and interest-based models is that delay in paying amount due can be charged for in the interest model, but not in the markup model. Islamic finance does not allow creditors to make any profits from delay of payment. So creditors in markup model will lose money if agents do not pay on time.
+
+To avoid delay of payment, the amount-due is capped by 50% of average income of the agent. In this manner, the amount-due will never exceed income, and therefore no past-dues will arise.
+
+
+Relative Behavior
+
+You also need to decide to what extend an agent is affected by the behavior of his neighbors. This is controlled by the "relativity" slide in the interface. A relativity = 
+0.5 means that 50% of desired consumption is decided by income and wealth, while 50% is decided by the average consumption of neighbors. Try relativity = 0.5, and see how economic behavior is affected by the three modes of finance.
+
+Immediately beneath the relativity slide is a slide for the standard deviation of the relativity parameter. That is, by how much agents get above or below the set value. If std-r = 30%, and relativity = .5, then gents will have a relativity value of 0.5 plus or minus 30% of the 0.5. So the range of relativity will be [0.1, 0.65].
+
+
+Income
+
+You may choose income from the Income slider. Choose the standard deviation from the std-income from the slider immediately beneath it. The chosen income level will be the average income across agents. For each agent, however, his income will be normally distributed, with mean = income, and standard deviation = std. The "std" is set in the slider beneath.
+
+Marginal propensity of consumption out of income is set in the income-propensity slider. The marginal propensity out of wealth is set in the wealth-propensity slider. The standard deviation for each is immediately beneath it.
+
+
+Loan Period
+
+You can decide the length of financing in the loan-period slider. Think of each period as a month. 60 periods is equivalent to 5 years. The interest rate and markup rate are calculated based on assuming each period to be one month.
+
+
+Delay Time
+
+This slider decides for how long a bankrupt agent will stay "unemployed". The longer the period, the greater is the drop in aggregate income and consumption.
+
+
+Allow-lending
+
+This button gives the user the ability to allow or not to allow for lending of any kind. This might be helpful to control forthe effect of charity/donation on consumption behavior.
+
+
+z
+
+This is the parameter used for charity/donation. z is a percentage value to be deducted from agents with higher net-worth than average. This is donation given by the rich to the needy. For the receiver, it is recorded as charity. To examine the impact of donation/charity, it is better to turn lending off, i.e. set "allow-lending" button off.
+
+
+Patches Screen
+
+The patches screen shows the consumption level of each agent (patch). The darker the color, the lower is the level of consumption. Red patches reflect bankrupt agents.
+
+
+Graphs
+
+All graphs have annotated explanations within.
+
+
+Consistency Checks
+
+To check the consistency of the model, the following conditions are examined:
+
+1. Total sources of funds must equal total uses of the funds. Hence, 
+   income + loan + charity - consumption - surplus = zero,
+
+2. Total shares of agents in accumulated surplus must be equal to one.
+
+3. Aggregate net wealth of the economy is simply total cash, since debt and credit cancel each other out.
+
+4. Total wealth equals total cash + total credit.
+ 
+
+## THINGS TO NOTICE AND TO TRY
+
+You can compare different modes of finance in various dimensions. 
+
+For example, compare cost of financing in interest-based lending and markup financing. Which one is higher? Why?
+
+Compare turnover rate. Which one is higher? What does it mean?
+
+Interest-based model uses compound interest (interest on unpaid interest). Try using simple interest on;y. Can you figure out how to change it? What impact does it have?
+
+
+## EXTENDING THE MODEL
+
+There are many ways to improve and extend the model.
+
+For example, income is exogenous to the model. It can be made endogenous by modelling investment.
+
+Financing is made centrally in the model. It can be made locally, i.e. for neighbors only.
+
+
+## CREDITS AND REFERENCES
+
+The author acknowledges the support of NetLogo group discussions.
+
+The Lorenz curve and Gini Index graphs are taken from NetLogo Models Library, Wealth Distribution, (c) Uri Wilensky.
+
+Original papers are:
+
+Al-Suwailem, Sami (2008) Islamic Economics in a Complex World, Islamic Development Bank.
+
+Al-Suwailem, Sami (2011) Behavioural Complexity, Journal of Economic Surveys, vol. 25.
+
+See also:
+
+Al-Suwailem, Sami (2013) Simulation in Islamic Economics, presentation made at Mohammadia School of Engineering.</info>
+  <turtleShapes>
+    <shape name="default" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="5"></point>
+        <point x="40" y="250"></point>
+        <point x="150" y="205"></point>
+        <point x="260" y="250"></point>
+      </polygon>
+    </shape>
+    <shape name="airplane" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="135" y="15"></point>
+        <point x="120" y="60"></point>
+        <point x="120" y="105"></point>
+        <point x="15" y="165"></point>
+        <point x="15" y="195"></point>
+        <point x="120" y="180"></point>
+        <point x="135" y="240"></point>
+        <point x="105" y="270"></point>
+        <point x="120" y="285"></point>
+        <point x="150" y="270"></point>
+        <point x="180" y="285"></point>
+        <point x="210" y="270"></point>
+        <point x="165" y="240"></point>
+        <point x="180" y="180"></point>
+        <point x="285" y="195"></point>
+        <point x="285" y="165"></point>
+        <point x="180" y="105"></point>
+        <point x="180" y="60"></point>
+        <point x="165" y="15"></point>
+      </polygon>
+    </shape>
+    <shape name="arrow" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="0" y="150"></point>
+        <point x="105" y="150"></point>
+        <point x="105" y="293"></point>
+        <point x="195" y="293"></point>
+        <point x="195" y="150"></point>
+        <point x="300" y="150"></point>
+      </polygon>
+    </shape>
+    <shape name="box" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="285"></point>
+        <point x="285" y="225"></point>
+        <point x="285" y="75"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="135"></point>
+        <point x="15" y="75"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="75"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="75"></point>
+        <point x="15" y="225"></point>
+        <point x="150" y="285"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <line endX="150" startY="285" marked="false" color="255" endY="135" startX="150"></line>
+      <line endX="15" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+      <line endX="285" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+    </shape>
+    <shape name="bug" rotatable="true" editableColorIndex="0">
+      <circle x="96" y="182" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="110" y="127" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <circle x="110" y="75" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <line endX="80" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+      <line endX="220" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+    </shape>
+    <shape name="butterfly" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="209" y="199"></point>
+        <point x="225" y="225"></point>
+        <point x="225" y="255"></point>
+        <point x="195" y="270"></point>
+        <point x="165" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="89" y="198"></point>
+        <point x="75" y="225"></point>
+        <point x="75" y="255"></point>
+        <point x="105" y="270"></point>
+        <point x="135" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="139" y="148"></point>
+        <point x="100" y="105"></point>
+        <point x="55" y="90"></point>
+        <point x="25" y="90"></point>
+        <point x="10" y="105"></point>
+        <point x="10" y="135"></point>
+        <point x="25" y="180"></point>
+        <point x="40" y="195"></point>
+        <point x="85" y="194"></point>
+        <point x="139" y="163"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="162" y="150"></point>
+        <point x="200" y="105"></point>
+        <point x="245" y="90"></point>
+        <point x="275" y="90"></point>
+        <point x="290" y="105"></point>
+        <point x="290" y="135"></point>
+        <point x="275" y="180"></point>
+        <point x="260" y="195"></point>
+        <point x="215" y="195"></point>
+        <point x="162" y="165"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="135" y="225"></point>
+        <point x="120" y="150"></point>
+        <point x="135" y="120"></point>
+        <point x="150" y="105"></point>
+        <point x="165" y="120"></point>
+        <point x="180" y="150"></point>
+        <point x="165" y="225"></point>
+      </polygon>
+      <circle x="135" y="90" marked="false" color="255" diameter="30" filled="true"></circle>
+      <line endX="195" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+      <line endX="105" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+    </shape>
+    <shape name="car" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="300" y="180"></point>
+        <point x="279" y="164"></point>
+        <point x="261" y="144"></point>
+        <point x="240" y="135"></point>
+        <point x="226" y="132"></point>
+        <point x="213" y="106"></point>
+        <point x="203" y="84"></point>
+        <point x="185" y="63"></point>
+        <point x="159" y="50"></point>
+        <point x="135" y="50"></point>
+        <point x="75" y="60"></point>
+        <point x="0" y="150"></point>
+        <point x="0" y="165"></point>
+        <point x="0" y="225"></point>
+        <point x="300" y="225"></point>
+        <point x="300" y="180"></point>
+      </polygon>
+      <circle x="180" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <circle x="30" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="162" y="80"></point>
+        <point x="132" y="78"></point>
+        <point x="134" y="135"></point>
+        <point x="209" y="135"></point>
+        <point x="194" y="105"></point>
+        <point x="189" y="96"></point>
+        <point x="180" y="89"></point>
+      </polygon>
+      <circle x="47" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+      <circle x="195" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+    </shape>
+    <shape name="circle" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="circle 2" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+    </shape>
+    <shape name="cow" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="200" y="193"></point>
+        <point x="197" y="249"></point>
+        <point x="179" y="249"></point>
+        <point x="177" y="196"></point>
+        <point x="166" y="187"></point>
+        <point x="140" y="189"></point>
+        <point x="93" y="191"></point>
+        <point x="78" y="179"></point>
+        <point x="72" y="211"></point>
+        <point x="49" y="209"></point>
+        <point x="48" y="181"></point>
+        <point x="37" y="149"></point>
+        <point x="25" y="120"></point>
+        <point x="25" y="89"></point>
+        <point x="45" y="72"></point>
+        <point x="103" y="84"></point>
+        <point x="179" y="75"></point>
+        <point x="198" y="76"></point>
+        <point x="252" y="64"></point>
+        <point x="272" y="81"></point>
+        <point x="293" y="103"></point>
+        <point x="285" y="121"></point>
+        <point x="255" y="121"></point>
+        <point x="242" y="118"></point>
+        <point x="224" y="167"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="73" y="210"></point>
+        <point x="86" y="251"></point>
+        <point x="62" y="249"></point>
+        <point x="48" y="208"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="25" y="114"></point>
+        <point x="16" y="195"></point>
+        <point x="9" y="204"></point>
+        <point x="23" y="213"></point>
+        <point x="25" y="200"></point>
+        <point x="39" y="123"></point>
+      </polygon>
+    </shape>
+    <shape name="cylinder" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="dot" rotatable="false" editableColorIndex="0">
+      <circle x="90" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+    </shape>
+    <shape name="face happy" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="90" y="239"></point>
+        <point x="62" y="213"></point>
+        <point x="47" y="191"></point>
+        <point x="67" y="179"></point>
+        <point x="90" y="203"></point>
+        <point x="109" y="218"></point>
+        <point x="150" y="225"></point>
+        <point x="192" y="218"></point>
+        <point x="210" y="203"></point>
+        <point x="227" y="181"></point>
+        <point x="251" y="194"></point>
+        <point x="236" y="217"></point>
+        <point x="212" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="face neutral" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="7" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <rectangle endX="240" startY="195" marked="false" color="255" endY="225" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="face sad" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="168"></point>
+        <point x="90" y="184"></point>
+        <point x="62" y="210"></point>
+        <point x="47" y="232"></point>
+        <point x="67" y="244"></point>
+        <point x="90" y="220"></point>
+        <point x="109" y="205"></point>
+        <point x="150" y="198"></point>
+        <point x="192" y="205"></point>
+        <point x="210" y="220"></point>
+        <point x="227" y="242"></point>
+        <point x="251" y="229"></point>
+        <point x="236" y="206"></point>
+        <point x="212" y="183"></point>
+      </polygon>
+    </shape>
+    <shape name="fish" rotatable="false" editableColorIndex="0">
+      <polygon color="-1" filled="true" marked="false">
+        <point x="44" y="131"></point>
+        <point x="21" y="87"></point>
+        <point x="15" y="86"></point>
+        <point x="0" y="120"></point>
+        <point x="15" y="150"></point>
+        <point x="0" y="180"></point>
+        <point x="13" y="214"></point>
+        <point x="20" y="212"></point>
+        <point x="45" y="166"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="135" y="195"></point>
+        <point x="119" y="235"></point>
+        <point x="95" y="218"></point>
+        <point x="76" y="210"></point>
+        <point x="46" y="204"></point>
+        <point x="60" y="165"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="75" y="45"></point>
+        <point x="83" y="77"></point>
+        <point x="71" y="103"></point>
+        <point x="86" y="114"></point>
+        <point x="166" y="78"></point>
+        <point x="135" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="136"></point>
+        <point x="151" y="77"></point>
+        <point x="226" y="81"></point>
+        <point x="280" y="119"></point>
+        <point x="292" y="146"></point>
+        <point x="292" y="160"></point>
+        <point x="287" y="170"></point>
+        <point x="270" y="195"></point>
+        <point x="195" y="210"></point>
+        <point x="151" y="212"></point>
+        <point x="30" y="166"></point>
+      </polygon>
+      <circle x="215" y="106" marked="false" color="255" diameter="30" filled="true"></circle>
+    </shape>
+    <shape name="flag" rotatable="false" editableColorIndex="0">
+      <rectangle endX="75" startY="15" marked="true" color="-1920102913" endY="300" startX="60" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="90" y="150"></point>
+        <point x="270" y="90"></point>
+        <point x="90" y="30"></point>
+      </polygon>
+      <line endX="90" startY="135" marked="true" color="-1920102913" endY="135" startX="75"></line>
+      <line endX="90" startY="45" marked="true" color="-1920102913" endY="45" startX="75"></line>
+    </shape>
+    <shape name="flower" rotatable="false" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="135" y="120"></point>
+        <point x="165" y="165"></point>
+        <point x="180" y="210"></point>
+        <point x="180" y="240"></point>
+        <point x="150" y="300"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="240"></point>
+        <point x="195" y="195"></point>
+        <point x="165" y="135"></point>
+      </polygon>
+      <circle x="85" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="147" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="192" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="85" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="70" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="25" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="96" y="51" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="113" y="68" marked="false" color="255" diameter="74" filled="true"></circle>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="189" y="233"></point>
+        <point x="219" y="188"></point>
+        <point x="249" y="173"></point>
+        <point x="279" y="188"></point>
+        <point x="234" y="218"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="180" y="255"></point>
+        <point x="150" y="210"></point>
+        <point x="105" y="210"></point>
+        <point x="75" y="240"></point>
+        <point x="135" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="house" rotatable="false" editableColorIndex="0">
+      <rectangle endX="255" startY="120" marked="true" color="-1920102913" endY="285" startX="45" filled="true"></rectangle>
+      <rectangle endX="180" startY="210" marked="false" color="255" endY="285" startX="120" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="120"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+      <line endX="270" startY="120" marked="false" color="255" endY="120" startX="30"></line>
+    </shape>
+    <shape name="leaf" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="210"></point>
+        <point x="135" y="195"></point>
+        <point x="120" y="210"></point>
+        <point x="60" y="210"></point>
+        <point x="30" y="195"></point>
+        <point x="60" y="180"></point>
+        <point x="60" y="165"></point>
+        <point x="15" y="135"></point>
+        <point x="30" y="120"></point>
+        <point x="15" y="105"></point>
+        <point x="40" y="104"></point>
+        <point x="45" y="90"></point>
+        <point x="60" y="90"></point>
+        <point x="90" y="105"></point>
+        <point x="105" y="120"></point>
+        <point x="120" y="120"></point>
+        <point x="105" y="60"></point>
+        <point x="120" y="60"></point>
+        <point x="135" y="30"></point>
+        <point x="150" y="15"></point>
+        <point x="165" y="30"></point>
+        <point x="180" y="60"></point>
+        <point x="195" y="60"></point>
+        <point x="180" y="120"></point>
+        <point x="195" y="120"></point>
+        <point x="210" y="105"></point>
+        <point x="240" y="90"></point>
+        <point x="255" y="90"></point>
+        <point x="263" y="104"></point>
+        <point x="285" y="105"></point>
+        <point x="270" y="120"></point>
+        <point x="285" y="135"></point>
+        <point x="240" y="165"></point>
+        <point x="240" y="180"></point>
+        <point x="270" y="195"></point>
+        <point x="240" y="210"></point>
+        <point x="180" y="210"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="195"></point>
+        <point x="135" y="240"></point>
+        <point x="120" y="255"></point>
+        <point x="105" y="255"></point>
+        <point x="105" y="285"></point>
+        <point x="135" y="285"></point>
+        <point x="165" y="240"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+    </shape>
+    <shape name="line" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="300" startX="150"></line>
+    </shape>
+    <shape name="line half" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="150" startX="150"></line>
+    </shape>
+    <shape name="link" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="300" startX="150"></line>
+    </shape>
+    <shape name="link direction" rotatable="true" editableColorIndex="0">
+      <line endX="30" startY="150" marked="true" color="-1920102913" endY="225" startX="150"></line>
+      <line endX="270" startY="150" marked="true" color="-1920102913" endY="225" startX="150"></line>
+    </shape>
+    <shape name="pentagon" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="15"></point>
+        <point x="15" y="120"></point>
+        <point x="60" y="285"></point>
+        <point x="240" y="285"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+    </shape>
+    <shape name="person" rotatable="false" editableColorIndex="0">
+      <circle x="110" y="5" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="120" y="195"></point>
+        <point x="90" y="285"></point>
+        <point x="105" y="300"></point>
+        <point x="135" y="300"></point>
+        <point x="150" y="225"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="300"></point>
+        <point x="210" y="285"></point>
+        <point x="180" y="195"></point>
+        <point x="195" y="90"></point>
+      </polygon>
+      <rectangle endX="172" startY="79" marked="true" color="-1920102913" endY="94" startX="127" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="195" y="90"></point>
+        <point x="240" y="150"></point>
+        <point x="225" y="180"></point>
+        <point x="165" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="60" y="150"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="105"></point>
+      </polygon>
+    </shape>
+    <shape name="plant" rotatable="false" editableColorIndex="0">
+      <rectangle endX="165" startY="90" marked="true" color="-1920102913" endY="300" startX="135" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="255"></point>
+        <point x="90" y="210"></point>
+        <point x="45" y="195"></point>
+        <point x="75" y="255"></point>
+        <point x="135" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="255"></point>
+        <point x="210" y="210"></point>
+        <point x="255" y="195"></point>
+        <point x="225" y="255"></point>
+        <point x="165" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="180"></point>
+        <point x="90" y="135"></point>
+        <point x="45" y="120"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="180"></point>
+        <point x="165" y="210"></point>
+        <point x="225" y="180"></point>
+        <point x="255" y="120"></point>
+        <point x="210" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="105"></point>
+        <point x="90" y="60"></point>
+        <point x="45" y="45"></point>
+        <point x="75" y="105"></point>
+        <point x="135" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="105"></point>
+        <point x="165" y="135"></point>
+        <point x="225" y="105"></point>
+        <point x="255" y="45"></point>
+        <point x="210" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="90"></point>
+        <point x="120" y="45"></point>
+        <point x="150" y="15"></point>
+        <point x="180" y="45"></point>
+        <point x="165" y="90"></point>
+      </polygon>
+    </shape>
+    <shape name="square" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+    </shape>
+    <shape name="square 2" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+      <rectangle endX="240" startY="60" marked="false" color="255" endY="240" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="star" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="151" y="1"></point>
+        <point x="185" y="108"></point>
+        <point x="298" y="108"></point>
+        <point x="207" y="175"></point>
+        <point x="242" y="282"></point>
+        <point x="151" y="216"></point>
+        <point x="59" y="282"></point>
+        <point x="94" y="175"></point>
+        <point x="3" y="108"></point>
+        <point x="116" y="108"></point>
+      </polygon>
+    </shape>
+    <shape name="target" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <circle x="60" y="60" marked="true" color="-1920102913" diameter="180" filled="true"></circle>
+      <circle x="90" y="90" marked="false" color="255" diameter="120" filled="true"></circle>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+    </shape>
+    <shape name="tree" rotatable="false" editableColorIndex="0">
+      <circle x="118" y="3" marked="true" color="-1920102913" diameter="94" filled="true"></circle>
+      <rectangle endX="180" startY="195" marked="false" color="-1653716737" endY="300" startX="120" filled="true"></rectangle>
+      <circle x="65" y="21" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="116" y="41" marked="true" color="-1920102913" diameter="127" filled="true"></circle>
+      <circle x="45" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+      <circle x="104" y="74" marked="true" color="-1920102913" diameter="152" filled="true"></circle>
+    </shape>
+    <shape name="triangle" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+    </shape>
+    <shape name="triangle 2" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="151" y="99"></point>
+        <point x="225" y="223"></point>
+        <point x="75" y="224"></point>
+      </polygon>
+    </shape>
+    <shape name="truck" rotatable="false" editableColorIndex="0">
+      <rectangle endX="195" startY="45" marked="true" color="-1920102913" endY="187" startX="4" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="296" y="193"></point>
+        <point x="296" y="150"></point>
+        <point x="259" y="134"></point>
+        <point x="244" y="104"></point>
+        <point x="208" y="104"></point>
+        <point x="207" y="194"></point>
+      </polygon>
+      <rectangle endX="195" startY="60" marked="false" color="-1" endY="105" startX="195" filled="true"></rectangle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="238" y="112"></point>
+        <point x="252" y="141"></point>
+        <point x="219" y="141"></point>
+        <point x="218" y="112"></point>
+      </polygon>
+      <circle x="234" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <rectangle endX="214" startY="185" marked="true" color="-1920102913" endY="194" startX="181" filled="true"></rectangle>
+      <circle x="144" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="144" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="234" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+    </shape>
+    <shape name="turtle" rotatable="true" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="215" y="204"></point>
+        <point x="240" y="233"></point>
+        <point x="246" y="254"></point>
+        <point x="228" y="266"></point>
+        <point x="215" y="252"></point>
+        <point x="193" y="210"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="195" y="90"></point>
+        <point x="225" y="75"></point>
+        <point x="245" y="75"></point>
+        <point x="260" y="89"></point>
+        <point x="269" y="108"></point>
+        <point x="261" y="124"></point>
+        <point x="240" y="105"></point>
+        <point x="225" y="105"></point>
+        <point x="210" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="105" y="90"></point>
+        <point x="75" y="75"></point>
+        <point x="55" y="75"></point>
+        <point x="40" y="89"></point>
+        <point x="31" y="108"></point>
+        <point x="39" y="124"></point>
+        <point x="60" y="105"></point>
+        <point x="75" y="105"></point>
+        <point x="90" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="132" y="85"></point>
+        <point x="134" y="64"></point>
+        <point x="107" y="51"></point>
+        <point x="108" y="17"></point>
+        <point x="150" y="2"></point>
+        <point x="192" y="18"></point>
+        <point x="192" y="52"></point>
+        <point x="169" y="65"></point>
+        <point x="172" y="87"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="85" y="204"></point>
+        <point x="60" y="233"></point>
+        <point x="54" y="254"></point>
+        <point x="72" y="266"></point>
+        <point x="85" y="252"></point>
+        <point x="107" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="119" y="75"></point>
+        <point x="179" y="75"></point>
+        <point x="209" y="101"></point>
+        <point x="224" y="135"></point>
+        <point x="220" y="225"></point>
+        <point x="175" y="261"></point>
+        <point x="128" y="261"></point>
+        <point x="81" y="224"></point>
+        <point x="74" y="135"></point>
+        <point x="88" y="99"></point>
+      </polygon>
+    </shape>
+    <shape name="wheel" rotatable="false" editableColorIndex="0">
+      <circle x="3" y="3" marked="true" color="-1920102913" diameter="294" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <line endX="150" startY="285" marked="true" color="-1920102913" endY="15" startX="150"></line>
+      <line endX="285" startY="150" marked="true" color="-1920102913" endY="150" startX="15"></line>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+      <line endX="79" startY="40" marked="true" color="-1920102913" endY="269" startX="216"></line>
+      <line endX="269" startY="84" marked="true" color="-1920102913" endY="221" startX="40"></line>
+      <line endX="269" startY="216" marked="true" color="-1920102913" endY="79" startX="40"></line>
+      <line endX="221" startY="40" marked="true" color="-1920102913" endY="269" startX="84"></line>
+    </shape>
+    <shape name="x" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="270" y="75"></point>
+        <point x="225" y="30"></point>
+        <point x="30" y="225"></point>
+        <point x="75" y="270"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="75"></point>
+        <point x="75" y="30"></point>
+        <point x="270" y="225"></point>
+        <point x="225" y="270"></point>
+      </polygon>
+    </shape>
+  </turtleShapes>
+  <linkShapes>
+    <shape name="default" curviness="0.0">
+      <lines>
+        <line x="-0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+        <line x="0.0" visible="true">
+          <dash value="1.0"></dash>
+          <dash value="0.0"></dash>
+        </line>
+        <line x="0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+      </lines>
+      <indicator>
+        <shape name="link direction" rotatable="true" editableColorIndex="0">
+          <line endX="90" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+          <line endX="210" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+        </shape>
+      </indicator>
+    </shape>
+  </linkShapes>
+  <previewCommands>setup repeat 75 [ go ]</previewCommands>
+  <experiments>
+    <experiment name="default" repetitions="20" sequentialRunOrder="true" runMetricsEveryStep="false" timeLimit="1500">
+      <setup>setup</setup>
+      <go>go</go>
+      <metrics>
+        <metric>seed-number</metric>
+        <metric>consumption-ag</metric>
+        <metric>consumption-md</metric>
+        <metric>max [consumption] of patches</metric>
+        <metric>min [consumption] of patches</metric>
+        <metric>var-c</metric>
+        <metric>net-income-ag</metric>
+        <metric>net-income-md</metric>
+        <metric>max [net-income] of patches</metric>
+        <metric>min [net-income] of patches</metric>
+        <metric>var-y</metric>
+        <metric>net-worth-ag</metric>
+        <metric>net-worth-md</metric>
+        <metric>net-wealth-ag</metric>
+        <metric>net-wealth-md</metric>
+        <metric>max [net-wealth] of patches</metric>
+        <metric>min [net-wealth] of patches</metric>
+        <metric>var-nw</metric>
+        <metric>var-w</metric>
+        <metric>total-wealth / 1225</metric>
+        <metric>total-debt / 1225</metric>
+        <metric>acc-c-wealth / 1225</metric>
+        <metric>mean [gross-debt] of patches</metric>
+        <metric>mean [interest-debt] of patches</metric>
+        <metric>mean [markup-debt] of patches</metric>
+        <metric>mean [acc-payment] of patches</metric>
+        <metric>mean [acc-loan] of patches</metric>
+        <metric>mean [no-of-loans] of patches</metric>
+        <metric>mean [acc-surplus] of patches</metric>
+        <metric><![CDATA[sum [consumption] of patches with [consumption < consumption-md]]]></metric>
+        <metric><![CDATA[sum [net-income] of patches with [net-income < net-income-md]]]></metric>
+        <metric><![CDATA[sum [net-wealth] of patches with [net-wealth < net-wealth-md]]]></metric>
+        <metric><![CDATA[sum [consumption] of patches with [consumption > consumption-md]]]></metric>
+        <metric><![CDATA[sum [net-income] of patches with [net-income > net-income-md]]]></metric>
+        <metric><![CDATA[sum [net-wealth] of patches with [net-wealth > net-wealth-md]]]></metric>
+        <metric>in-flow / 1225</metric>
+        <metric>out-flow / 1225</metric>
+        <metric>capital / 1225</metric>
+        <metric>total-acc-payment / 1225</metric>
+        <metric>total-acc-interest-payment / 1225</metric>
+        <metric>total-acc-principal-payment / 1225</metric>
+        <metric>loan-funds / 1225</metric>
+        <metric>total-deficit / 1225</metric>
+        <metric>total-loan / 1225</metric>
+        <metric>acc-bankrupt</metric>
+        <metric><![CDATA[count patches with [net-income < 0]]]></metric>
+        <metric>count patches with [net-worth = 0]</metric>
+        <metric><![CDATA[count patches with [consumption < .5 * max [consumption] of patches]]]></metric>
+        <metric><![CDATA[count patches with [net-income < .5 * max [net-income] of patches]]]></metric>
+        <metric><![CDATA[count patches with [net-wealth < .5 * max [net-wealth] of patches]]]></metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="set-time-end">
+          <value value="1500"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="r">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="z">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="loan-period">
+          <value value="60"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="std">
+          <value value="0.15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="avg-income">
+          <value value="75"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="std-avg-income">
+          <value value="0.3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="wealth-propensity">
+          <value value="0.01"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="allow-lending">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="income-propensity">
+          <value value="0.85"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="relativity">
+          <value value="0.5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="std-r">
+          <value value="0.3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="fix-random-seed">
+          <value value="false"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="m">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="std-mpc-w">
+          <value value="0.3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="std-mpc">
+          <value value="0.15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="delay-time">
+          <value value="15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="limit-amount-due">
+          <value value="true"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="no relativity" repetitions="20" sequentialRunOrder="true" runMetricsEveryStep="false" timeLimit="1500">
+      <setup>setup</setup>
+      <go>go</go>
+      <metrics>
+        <metric>seed-number</metric>
+        <metric>consumption-ag</metric>
+        <metric>consumption-md</metric>
+        <metric>max [consumption] of patches</metric>
+        <metric>min [consumption] of patches</metric>
+        <metric>var-c</metric>
+        <metric>net-income-ag</metric>
+        <metric>net-income-md</metric>
+        <metric>max [net-income] of patches</metric>
+        <metric>min [net-income] of patches</metric>
+        <metric>var-y</metric>
+        <metric>net-worth-ag</metric>
+        <metric>net-worth-md</metric>
+        <metric>net-wealth-ag</metric>
+        <metric>net-wealth-md</metric>
+        <metric>max [net-wealth] of patches</metric>
+        <metric>min [net-wealth] of patches</metric>
+        <metric>var-nw</metric>
+        <metric>var-w</metric>
+        <metric>total-wealth / 1225</metric>
+        <metric>total-debt / 1225</metric>
+        <metric>acc-c-wealth / 1225</metric>
+        <metric>mean [gross-debt] of patches</metric>
+        <metric>mean [interest-debt] of patches</metric>
+        <metric>mean [markup-debt] of patches</metric>
+        <metric>mean [acc-payment] of patches</metric>
+        <metric>mean [acc-loan] of patches</metric>
+        <metric>mean [no-of-loans] of patches</metric>
+        <metric>mean [acc-surplus] of patches</metric>
+        <metric><![CDATA[sum [consumption] of patches with [consumption < consumption-md]]]></metric>
+        <metric><![CDATA[sum [net-income] of patches with [net-income < net-income-md]]]></metric>
+        <metric><![CDATA[sum [net-wealth] of patches with [net-wealth < net-wealth-md]]]></metric>
+        <metric><![CDATA[sum [consumption] of patches with [consumption > consumption-md]]]></metric>
+        <metric><![CDATA[sum [net-income] of patches with [net-income > net-income-md]]]></metric>
+        <metric><![CDATA[sum [net-wealth] of patches with [net-wealth > net-wealth-md]]]></metric>
+        <metric>in-flow / 1225</metric>
+        <metric>out-flow / 1225</metric>
+        <metric>capital / 1225</metric>
+        <metric>total-acc-payment / 1225</metric>
+        <metric>total-acc-interest-payment / 1225</metric>
+        <metric>total-acc-principal-payment / 1225</metric>
+        <metric>loan-funds / 1225</metric>
+        <metric>total-deficit / 1225</metric>
+        <metric>total-loan / 1225</metric>
+        <metric>acc-bankrupt</metric>
+        <metric><![CDATA[count patches with [net-income < 0]]]></metric>
+        <metric>count patches with [net-worth = 0]</metric>
+        <metric><![CDATA[count patches with [consumption < .5 * max [consumption] of patches]]]></metric>
+        <metric><![CDATA[count patches with [net-income < .5 * max [net-income] of patches]]]></metric>
+        <metric><![CDATA[count patches with [net-wealth < .5 * max [net-wealth] of patches]]]></metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="set-time-end">
+          <value value="1500"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="r">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="z">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="loan-period">
+          <value value="60"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="std">
+          <value value="0.15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="avg-income">
+          <value value="75"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="std-avg-income">
+          <value value="0.3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="wealth-propensity">
+          <value value="0.01"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="allow-lending">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="income-propensity">
+          <value value="0.85"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="relativity">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="std-r">
+          <value value="0.3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="fix-random-seed">
+          <value value="false"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="m">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="std-mpc-w">
+          <value value="0.3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="std-mpc">
+          <value value="0.15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="delay-time">
+          <value value="15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="limit-amount-due">
+          <value value="true"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="markup" repetitions="50" sequentialRunOrder="true" runMetricsEveryStep="false" timeLimit="1500">
+      <setup>setup</setup>
+      <go>go</go>
+      <metrics>
+        <metric>seed-number</metric>
+        <metric>consumption-ag</metric>
+        <metric>consumption-md</metric>
+        <metric>max [consumption] of patches</metric>
+        <metric>min [consumption] of patches</metric>
+        <metric>var-c</metric>
+        <metric>consumption-gap</metric>
+        <metric>net-income-ag</metric>
+        <metric>net-income-md</metric>
+        <metric>max [net-income] of patches</metric>
+        <metric>min [net-income] of patches</metric>
+        <metric>var-y</metric>
+        <metric>net-income-gap</metric>
+        <metric>net-worth-ag</metric>
+        <metric>net-worth-md</metric>
+        <metric>max [net-worth] of patches</metric>
+        <metric>min [net-worth] of patches</metric>
+        <metric>var-nw</metric>
+        <metric>net-worth-gap</metric>
+        <metric>total-wealth / 1225</metric>
+        <metric>total-debt / 1225</metric>
+        <metric>acc-c-wealth / 1225</metric>
+        <metric>mean [gross-debt] of patches</metric>
+        <metric>mean [interest-debt] of patches</metric>
+        <metric>mean [markup-debt] of patches</metric>
+        <metric>mean [acc-payment] of patches</metric>
+        <metric>mean [acc-loan] of patches</metric>
+        <metric>mean [no-of-loans] of patches</metric>
+        <metric><![CDATA[sum [consumption] of patches with [consumption < consumption-md]]]></metric>
+        <metric><![CDATA[sum [net-income] of patches with [net-income < net-income-md]]]></metric>
+        <metric><![CDATA[sum [net-worth] of patches with [net-worth < net-worth-md]]]></metric>
+        <metric><![CDATA[sum [consumption] of patches with [consumption > consumption-md]]]></metric>
+        <metric><![CDATA[sum [net-income] of patches with [net-income > net-income-md]]]></metric>
+        <metric><![CDATA[sum [net-worth] of patches with [net-worth > net-worth-md]]]></metric>
+        <metric>in-flow / 1225</metric>
+        <metric>out-flow / 1225</metric>
+        <metric>capital / 1225</metric>
+        <metric>total-acc-payment / 1225</metric>
+        <metric>total-acc-interest-payment / 1225</metric>
+        <metric>total-acc-principal-payment / 1225</metric>
+        <metric>loan-funds / 1225</metric>
+        <metric>total-deficit / 1225</metric>
+        <metric>total-loan / 1225</metric>
+        <metric>acc-bankrupt</metric>
+        <metric><![CDATA[count patches with [net-income < 0]]]></metric>
+        <metric>count patches with [net-worth = 0]</metric>
+        <metric><![CDATA[count patches with [consumption < .5 * max [consumption] of patches]]]></metric>
+        <metric><![CDATA[count patches with [net-income < .5 * max [net-income] of patches]]]></metric>
+        <metric><![CDATA[count patches with [net-worth < .5 * max [net-worth] of patches]]]></metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="set-time-end">
+          <value value="1500"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="r">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="z">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="loan-period">
+          <value value="60"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="std">
+          <value value="0.15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="avg-income">
+          <value value="75"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="std-avg-income">
+          <value value="0.3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="wealth-propensity">
+          <value value="0.01"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="allow-lending">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="income-propensity">
+          <value value="0.85"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="relativity">
+          <value value="0.5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="std-r">
+          <value value="0.3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="fix-random-seed">
+          <value value="false"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="m">
+          <value value="6"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="std-mpc-w">
+          <value value="0.3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="std-mpc">
+          <value value="0.15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="delay-time">
+          <value value="15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="limit-amount-due">
+          <value value="true"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="interest" repetitions="50" sequentialRunOrder="true" runMetricsEveryStep="false" timeLimit="1500">
+      <setup>setup</setup>
+      <go>go</go>
+      <metrics>
+        <metric>seed-number</metric>
+        <metric>consumption-ag</metric>
+        <metric>consumption-md</metric>
+        <metric>max [consumption] of patches</metric>
+        <metric>min [consumption] of patches</metric>
+        <metric>var-c</metric>
+        <metric>consumption-gap</metric>
+        <metric>net-income-ag</metric>
+        <metric>net-income-md</metric>
+        <metric>max [net-income] of patches</metric>
+        <metric>min [net-income] of patches</metric>
+        <metric>var-y</metric>
+        <metric>net-income-gap</metric>
+        <metric>net-worth-ag</metric>
+        <metric>net-worth-md</metric>
+        <metric>max [net-worth] of patches</metric>
+        <metric>min [net-worth] of patches</metric>
+        <metric>var-nw</metric>
+        <metric>net-worth-gap</metric>
+        <metric>total-wealth / 1225</metric>
+        <metric>total-debt / 1225</metric>
+        <metric>acc-c-wealth / 1225</metric>
+        <metric>mean [gross-debt] of patches</metric>
+        <metric>mean [interest-debt] of patches</metric>
+        <metric>mean [markup-debt] of patches</metric>
+        <metric>mean [acc-payment] of patches</metric>
+        <metric>mean [acc-loan] of patches</metric>
+        <metric>mean [no-of-loans] of patches</metric>
+        <metric><![CDATA[sum [consumption] of patches with [consumption < consumption-md]]]></metric>
+        <metric><![CDATA[sum [net-income] of patches with [net-income < net-income-md]]]></metric>
+        <metric><![CDATA[sum [net-worth] of patches with [net-worth < net-worth-md]]]></metric>
+        <metric><![CDATA[sum [consumption] of patches with [consumption > consumption-md]]]></metric>
+        <metric><![CDATA[sum [net-income] of patches with [net-income > net-income-md]]]></metric>
+        <metric><![CDATA[sum [net-worth] of patches with [net-worth > net-worth-md]]]></metric>
+        <metric>in-flow / 1225</metric>
+        <metric>out-flow / 1225</metric>
+        <metric>capital / 1225</metric>
+        <metric>total-acc-payment / 1225</metric>
+        <metric>total-acc-interest-payment / 1225</metric>
+        <metric>total-acc-principal-payment / 1225</metric>
+        <metric>loan-funds / 1225</metric>
+        <metric>total-deficit / 1225</metric>
+        <metric>total-loan / 1225</metric>
+        <metric>acc-bankrupt</metric>
+        <metric><![CDATA[count patches with [net-income < 0]]]></metric>
+        <metric>count patches with [net-worth = 0]</metric>
+        <metric><![CDATA[count patches with [consumption < .5 * max [consumption] of patches]]]></metric>
+        <metric><![CDATA[count patches with [net-income < .5 * max [net-income] of patches]]]></metric>
+        <metric><![CDATA[count patches with [net-worth < .5 * max [net-worth] of patches]]]></metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="set-time-end">
+          <value value="1500"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="r">
+          <value value="6"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="z">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="loan-period">
+          <value value="60"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="std">
+          <value value="0.15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="avg-income">
+          <value value="75"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="std-avg-income">
+          <value value="0.3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="wealth-propensity">
+          <value value="0.01"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="allow-lending">
+          <value value="true"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="income-propensity">
+          <value value="0.85"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="relativity">
+          <value value="0.5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="std-r">
+          <value value="0.3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="fix-random-seed">
+          <value value="false"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="m">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="std-mpc-w">
+          <value value="0.3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="std-mpc">
+          <value value="0.15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="delay-time">
+          <value value="15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="limit-amount-due">
+          <value value="true"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="zakat" repetitions="50" sequentialRunOrder="true" runMetricsEveryStep="false" timeLimit="1500">
+      <setup>setup</setup>
+      <go>go</go>
+      <metrics>
+        <metric>seed-number</metric>
+        <metric>consumption-ag</metric>
+        <metric>consumption-md</metric>
+        <metric>max [consumption] of patches</metric>
+        <metric>min [consumption] of patches</metric>
+        <metric>var-c</metric>
+        <metric>consumption-gap</metric>
+        <metric>net-income-ag</metric>
+        <metric>net-income-md</metric>
+        <metric>max [net-income] of patches</metric>
+        <metric>min [net-income] of patches</metric>
+        <metric>var-y</metric>
+        <metric>net-income-gap</metric>
+        <metric>net-worth-ag</metric>
+        <metric>net-worth-md</metric>
+        <metric>max [net-worth] of patches</metric>
+        <metric>min [net-worth] of patches</metric>
+        <metric>var-nw</metric>
+        <metric>net-worth-gap</metric>
+        <metric>total-wealth / 1225</metric>
+        <metric>total-debt / 1225</metric>
+        <metric>acc-c-wealth / 1225</metric>
+        <metric>in-flow / 1225</metric>
+        <metric>out-flow / 1225</metric>
+        <metric>capital / 1225</metric>
+        <metric>loan-funds / 1225</metric>
+        <metric>total-deficit / 1225</metric>
+        <metric><![CDATA[count patches with [net-income < 0]]]></metric>
+        <metric>count patches with [net-worth = 0]</metric>
+        <metric><![CDATA[count patches with [consumption < .5 * max [consumption] of patches]]]></metric>
+        <metric><![CDATA[count patches with [net-income < .5 * max [net-income] of patches]]]></metric>
+        <metric><![CDATA[count patches with [net-worth < .5 * max [net-worth] of patches]]]></metric>
+        <metric>z-funds / 1225</metric>
+        <metric>z-share</metric>
+        <metric>sum [consumption] of patches with [donor = 1]</metric>
+        <metric>sum [net-income] of patches with [donor = 1]</metric>
+        <metric>sum [net-worth] of patches with [donor = 1]</metric>
+        <metric>sum [consumption] of patches with [donor = -1]</metric>
+        <metric>sum [net-income] of patches with [donor = -1]</metric>
+        <metric>sum [net-worth] of patches with [donor = -1]</metric>
+        <metric>count patches with [donor = 1]</metric>
+        <metric>count patches with [donor = -1]</metric>
+        <metric>sum [charity] of patches</metric>
+        <metric><![CDATA[count patches with [charity > 0]]]></metric>
+        <metric><![CDATA[count patches with [consumption < .5 * max [consumption] of patches]]]></metric>
+        <metric><![CDATA[count patches with [net-income < .5 * max [net-income] of patches]]]></metric>
+        <metric><![CDATA[count patches with [net-worth < .5 * max [net-worth] of patches]]]></metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="set-time-end">
+          <value value="1500"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="r">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="z">
+          <value value="0"></value>
+          <value value="2.5"></value>
+          <value value="5"></value>
+          <value value="10"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="loan-period">
+          <value value="60"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="std">
+          <value value="0.15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="avg-income">
+          <value value="75"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="std-avg-income">
+          <value value="0.3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="wealth-propensity">
+          <value value="0.01"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="allow-lending">
+          <value value="false"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="income-propensity">
+          <value value="0.85"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="relativity">
+          <value value="0.5"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="std-r">
+          <value value="0.3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="fix-random-seed">
+          <value value="false"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="m">
+          <value value="0"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="std-mpc-w">
+          <value value="0.3"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="std-mpc">
+          <value value="0.15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="delay-time">
+          <value value="15"></value>
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="limit-amount-due">
+          <value value="true"></value>
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+  </experiments>
+</model>
